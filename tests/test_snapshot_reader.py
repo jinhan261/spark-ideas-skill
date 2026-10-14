@@ -41,7 +41,8 @@ def load_module():
     spec = importlib.util.spec_from_file_location("spark_snapshot_reader", READER_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    with mock.patch.object(sys, "path", [str(READER_PATH.parent), *sys.path]):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -152,7 +153,9 @@ class ReaderTests(unittest.TestCase):
     def test_invalid_cli_ranges_fail_without_traceback(self):
         for arguments in (("list", "--limit", "101"), ("list", "--offset", "-1"),
                           ("get", "--id", FIRST_ID, "--body-limit", "16001"),
-                          ("get", "--id", FIRST_ID, "--body-offset", "-1")):
+                          ("get", "--id", FIRST_ID, "--body-offset", "-1"),
+                          ("list", "--created-after", "0001-01-01T00:00:00+14:00"),
+                          ("list", "--created-before", "9999-12-31T23:59:59-14:00")):
             with self.subTest(arguments=arguments):
                 result = subprocess.run([sys.executable, str(READER_PATH), "--snapshot",
                                          str(self.path), *arguments], capture_output=True,

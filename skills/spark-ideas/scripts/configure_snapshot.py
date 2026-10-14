@@ -8,17 +8,23 @@ import sys
 import tempfile
 
 from read_snapshot import SafeParser, SnapshotError, default_config, selected_path
+from discovery import DiscoveryError, discover_snapshot, source_id
 
 
 def main(argv=None):
     temporary = None
     try:
         parser = SafeParser(description="Explicitly save one selected Spark file path, without reading its contents.")
-        parser.add_argument("--snapshot", required=True)
+        selection = parser.add_mutually_exclusive_group(required=True)
+        selection.add_argument("--snapshot")
+        selection.add_argument("--auto", action="store_true", help="Discover the single Spark source in its fixed iCloud directory")
+        parser.add_argument("--source", type=source_id, help="Choose a listed Spark source UUID with --auto")
         parser.add_argument("--config", default=default_config())
         parser.add_argument("--replace", action="store_true", help="Explicitly replace an existing local path setting")
         args = parser.parse_args(argv)
-        snapshot = selected_path(args.snapshot)
+        if args.source is not None and not args.auto:
+            raise SnapshotError("invalid_arguments", "Use --source only with --auto.")
+        snapshot = discover_snapshot(source=args.source)["path"] if args.auto else selected_path(args.snapshot)
         target = Path(selected_path(args.config))
         if target.is_symlink():
             raise SnapshotError("configuration_unavailable", "The local configuration is not a regular setting file.")
@@ -41,6 +47,12 @@ def main(argv=None):
         temporary = None
         print(json.dumps({"configured": True, "noteContentRead": False}))
         return 0
+    except DiscoveryError as error:
+        result = {"error": {"code": error.code, "message": error.message}}
+        if error.sources is not None:
+            result["sources"] = error.sources
+        print(json.dumps(result, sort_keys=True))
+        return 1
     except SnapshotError as error:
         print(json.dumps({"error": {"code": error.code, "message": error.message}}, sort_keys=True))
         return 1

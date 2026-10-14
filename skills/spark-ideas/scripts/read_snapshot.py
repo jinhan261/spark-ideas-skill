@@ -13,6 +13,8 @@ import subprocess
 import sys
 import uuid
 
+from discovery import DiscoveryError, default_root, discover_snapshot, root_chain_guard, source_id
+
 MAX_BYTES = 16 * 1024 * 1024
 MAX_IDEAS = 20_000
 MAX_BODY_BYTES = 256 * 1024
@@ -70,14 +72,17 @@ def file_identity(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def bounded_bytes(path, metadata_probe):
+def bounded_bytes(path, metadata_probe, directory_fd=None):
     descriptor = None
     try:
-        before_path = os.lstat(path)
+        before_path = (os.stat("ideas.json", dir_fd=directory_fd, follow_symlinks=False)
+                       if directory_fd is not None else os.lstat(path))
         if not stat.S_ISREG(before_path.st_mode) or before_path.st_size > MAX_BYTES:
             fail("snapshot_invalid", "The selected file is not a bounded regular snapshot file.")
         metadata_probe(path)
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        descriptor = os.open("ideas.json" if directory_fd is not None else path,
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                             dir_fd=directory_fd)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or file_identity(before) != file_identity(before_path):
             fail("snapshot_changed", "The selected file changed during reading. Retry the request.")
@@ -119,8 +124,11 @@ def unique_object(pairs):
 def timestamp(value):
     if not isinstance(value, str) or len(value) > 64 or not DATE_PATTERN.fullmatch(value):
         raise ValueError()
-    parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    return parsed.astimezone(dt.timezone.utc)
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        return parsed.astimezone(dt.timezone.utc)
+    except OverflowError:
+        raise ValueError() from None
 
 
 def uuid_text(value):
@@ -175,8 +183,8 @@ def decode_snapshot(data):
         fail("snapshot_invalid", "The selected file is not a valid supported Spark snapshot. No records are exposed.")
 
 
-def read_snapshot(path, metadata_probe=None):
-    data = bounded_bytes(selected_path(path), metadata_probe or probe_macos)
+def read_snapshot(path, metadata_probe=None, directory_fd=None):
+    data = bounded_bytes(selected_path(path), metadata_probe or probe_macos, directory_fd)
     return {"snapshot": decode_snapshot(data), "fingerprint": hashlib.sha256(data).hexdigest()}
 
 
@@ -195,6 +203,73 @@ def configured_snapshot(config):
         return selected_path(value["snapshot"])
     except (SnapshotError, ValueError, UnicodeError, RecursionError):
         fail("configuration_unavailable", "Confirm a snapshot file and configure its path before reading Spark notes.")
+
+
+def resolve_snapshot(args):
+    """Pinned configuration wins; only an absent config permits discovery."""
+    if args.snapshot is not None:
+        return selected_path(args.snapshot), None
+    config = selected_path(args.config)
+    try:
+        os.lstat(config)
+    except FileNotFoundError:
+        candidate = discover_snapshot(source=args.source)
+        return candidate["path"], candidate["sourceID"]
+    except OSError:
+        fail("configuration_unavailable", "The saved Spark source cannot be checked. No other source is used.")
+    if args.source is not None:
+        fail("invalid_arguments", "A Spark source is already pinned. Use configure_snapshot.py --auto --source with --replace to change it explicitly.")
+    path = configured_snapshot(config)
+    expected = None
+    if Path(path).name == "ideas.json" and Path(path).parent.parent == default_root():
+        try:
+            expected = source_id(Path(path).parent.name)
+        except DiscoveryError:
+            fail("configuration_unavailable", "The saved Spark source is invalid. No other source is used.")
+    return path, expected
+
+
+def source_directory_guard(path):
+    """Reject changed/symlinked source directories around automatically located reads."""
+    root = Path(path).parent.parent
+    source = Path(path).parent
+    try:
+        root_chain = root_chain_guard(root)
+        root_info, source_info = os.lstat(root), os.lstat(source)
+        if not stat.S_ISDIR(root_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
+            fail("snapshot_unavailable", "The Spark source is not a regular directory. No records are exposed.")
+        return (root_chain, (root_info.st_dev, root_info.st_ino, root_info.st_mode),
+                (source_info.st_dev, source_info.st_ino, source_info.st_mode))
+    except OSError:
+        fail("snapshot_unavailable", "The selected Spark source is unavailable. No other source is used.")
+
+
+def read_discovered_snapshot(path, expected_source):
+    """Open the guarded source with openat, so a directory race cannot redirect reads."""
+    root_fd = source_fd = None
+    try:
+        guard = source_directory_guard(path)
+        root_fd = os.open(Path(path).parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        root_info = os.fstat(root_fd)
+        if (root_info.st_dev, root_info.st_ino, root_info.st_mode) != guard[1]:
+            fail("snapshot_changed", "The Spark source changed during reading. Retry the request.")
+        source_fd = os.open(Path(path).parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+        source_info = os.fstat(source_fd)
+        if (source_info.st_dev, source_info.st_ino, source_info.st_mode) != guard[2]:
+            fail("snapshot_changed", "The Spark source changed during reading. Retry the request.")
+        read = read_snapshot(path, directory_fd=source_fd)
+        if guard != source_directory_guard(path):
+            fail("snapshot_changed", "The Spark source changed during reading. Retry the request.")
+        if uuid_text(read["snapshot"]["sourceInstallationID"]) != expected_source:
+            fail("snapshot_invalid", "The snapshot does not belong to its Spark device source. No records are exposed.")
+        return read
+    except OSError:
+        fail("snapshot_unavailable", "The selected Spark source is unavailable. No other source is used.")
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def metadata(read):
@@ -222,7 +297,9 @@ class SafeParser(argparse.ArgumentParser):
 
 def parser():
     p = SafeParser(description="Read one selected Spark snapshot without modifying it.")
-    p.add_argument("--snapshot", help="Explicitly authorized absolute ideas.json path")
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument("--snapshot", help="Explicitly authorized absolute ideas.json path")
+    selection.add_argument("--source", type=source_id, help="Source UUID selected from Spark's fixed iCloud directory")
     p.add_argument("--config", default=default_config(), help="Absolute local path-setting file")
     commands = p.add_subparsers(dest="command", required=True, parser_class=SafeParser)
     commands.add_parser("status", help="Availability and metadata only; no note text")
@@ -294,9 +371,16 @@ def emit(value):
 def main(argv=None):
     try:
         args = parser().parse_args(argv)
-        path = args.snapshot if args.snapshot is not None else configured_snapshot(args.config)
-        emit(response(args, read_snapshot(path)))
+        path, expected_source = resolve_snapshot(args)
+        read = read_discovered_snapshot(path, expected_source) if expected_source is not None else read_snapshot(path)
+        emit(response(args, read))
         return 0
+    except DiscoveryError as error:
+        result = {"error": {"code": error.code, "message": error.message}}
+        if error.sources is not None:
+            result["sources"] = error.sources
+        print(json.dumps(result, sort_keys=True))
+        return 1
     except SnapshotError as error:
         print(json.dumps({"error": {"code": error.code, "message": error.message}}, sort_keys=True))
         return 1
